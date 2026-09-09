@@ -1,0 +1,2179 @@
+#!/usr/bin/env python3
+"""
+====================================================================
+  Telegram Group Management Bot  —  single-file production build
+  Framework : Pyrogram (async) + Motor (async MongoDB)
+====================================================================
+
+FEATURES
+    - Join request management (approve / decline / decline-with-reason /
+      mute / ban) with synchronized cards across the group + every admin PM
+    - CAPTCHA verification before a join request is approved
+    - Imposter / pretender detection (username / first name / last name
+      change tracking), persisted in MongoDB
+    - Ban / unban, mute / unmute, temporary ban / mute (persisted +
+      recovered on restart)
+    - Declined-user and banned-user tracking with paginated listings
+    - Internal bot-admin system, separate from real Telegram admins
+    - Restart-safe: every piece of state lives in MongoDB, not RAM
+
+Only three third-party packages are required:
+    pip install pyrogram tgcrypto motor pymongo python-dotenv
+
+Required environment variables:
+    API_ID, API_HASH, BOT_TOKEN, MONGO_URL, OWNER_ID
+
+See the bottom of this file / the accompanying chat message for the
+full setup guide, command list and test checklist.
+====================================================================
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import os
+import re
+import sys
+import html
+import time
+import uuid
+import random
+import asyncio
+import logging
+import datetime
+from typing import Optional, Dict, Any, List, Tuple
+
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message,
+    CallbackQuery,
+    ChatJoinRequest,
+    User,
+    Chat,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ChatPermissions,
+)
+from pyrogram.enums import ChatMemberStatus, ChatMembersFilter
+from pyrogram.errors import (
+    RPCError,
+    FloodWait,
+    ChatAdminRequired,
+    UserAdminInvalid,
+    PeerIdInvalid,
+    ChannelInvalid,
+    ChatWriteForbidden,
+    UserIsBlocked,
+    InputUserDeactivated,
+    MessageNotModified,
+    MessageIdInvalid,
+    UsernameNotOccupied,
+    UsernameInvalid,
+)
+
+import motor.motor_asyncio
+from pymongo import ReturnDocument, ASCENDING, DESCENDING
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # python-dotenv is optional; env vars still work without it
+    pass
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}")
+
+
+API_ID = _env_int("API_ID", "8045459"))
+API_HASH = os.getenv("API_HASH", "e6d1f09120e17a4372fe022dde88511b")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8244250546:AAEuPSONBf-pnA-pdB3ceNvIqWjRB30eH1w")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb+srv://zewdatabase:ijoXgdmQ0NCyg9DO@zewgame.urb3i.mongodb.net/ontap?retryWrites=true&w=majority")
+OWNER_ID = _env_int("OWNER_ID", "8671058334"))
+
+# Behavioural defaults (can be overridden per-group via /joinreq settings)
+DEFAULT_CAPTCHA_TIMEOUT = _env_int("CAPTCHA_TIMEOUT", 300)          # 5 minutes
+DEFAULT_CAPTCHA_MAX_ATTEMPTS = _env_int("CAPTCHA_MAX_ATTEMPTS", 3)
+DEFAULT_CAPTCHA_AUTO_APPROVE = os.getenv("CAPTCHA_AUTO_APPROVE", "true").strip().lower() == "true"
+DEFAULT_DECLINE_ON_CAPTCHA_FAIL = os.getenv("CAPTCHA_DECLINE_ON_FAIL", "true").strip().lower() == "true"
+DEFAULT_DECLINE_ON_CAPTCHA_TIMEOUT = os.getenv("CAPTCHA_DECLINE_ON_TIMEOUT", "false").strip().lower() == "true"
+
+SWEEP_INTERVAL_SECONDS = 20  # background reconciliation loop for captcha/temp-actions
+
+_missing = [
+    n
+    for n, v in (
+        ("API_ID", API_ID),
+        ("API_HASH", API_HASH),
+        ("BOT_TOKEN", BOT_TOKEN),
+        ("MONGO_URL", MONGO_URL),
+        ("OWNER_ID", OWNER_ID),
+    )
+    if not v
+]
+if _missing:
+    raise RuntimeError(
+        "Missing required environment variable(s): "
+        + ", ".join(_missing)
+        + ". Set API_ID, API_HASH, BOT_TOKEN, MONGO_URL and OWNER_ID before starting the bot."
+    )
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logger = logging.getLogger("joinreq-bot")
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
+db = mongo_client.get_database("group_management_bot")
+
+group_settings_coll = db.get_collection("group_settings")
+bot_admins_coll = db.get_collection("bot_admins")
+user_profiles_coll = db.get_collection("user_profiles")
+declined_users_coll = db.get_collection("declined_users")
+banned_users_coll = db.get_collection("banned_users")
+captcha_sessions_coll = db.get_collection("captcha_sessions")
+temporary_actions_coll = db.get_collection("temporary_actions")
+protected_users_coll = db.get_collection("protected_users")
+
+
+async def ensure_indexes():
+    await group_settings_coll.create_index("chat_id", unique=True)
+    await bot_admins_coll.create_index("user_id", unique=True)
+    await user_profiles_coll.create_index("user_id", unique=True)
+    await declined_users_coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+    await declined_users_coll.create_index("timestamp")
+    await banned_users_coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    await captcha_sessions_coll.create_index("token", unique=True)
+    await captcha_sessions_coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+    await captcha_sessions_coll.create_index("expires_at")
+    await temporary_actions_coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+    await temporary_actions_coll.create_index("expires_at")
+    await protected_users_coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    await protected_users_coll.create_index([("chat_id", ASCENDING), ("username", ASCENDING)])
+    logger.info("MongoDB indexes ensured.")
+
+
+# ============================================================
+# IN-MEMORY (non-authoritative) STATE
+# ------------------------------------------------------------
+# Everything here is a *cache*/lock convenience only. Nothing that
+# must survive a restart is kept exclusively here — MongoDB is the
+# source of truth for all persistent state (see DATABASE section).
+# ============================================================
+
+# (chat_id, user_id) -> {location_id: message_id}
+# location_id is either an admin's user id (their PM) or the group's own
+# chat_id (the card posted directly in the group).
+PENDING_REQUEST_MSGS: Dict[Tuple[int, int], Dict[int, int]] = {}
+
+# admin_id -> {chat_id, user_id, expires_at}   (used for "decline with reason")
+PENDING_REASON_PROMPTS: Dict[int, Dict[str, Any]] = {}
+
+# callback_data guard to stop double-processing near-simultaneous clicks
+_CALLBACK_LOCKS: Dict[str, float] = {}
+_CALLBACK_LOCK_WINDOW = 2.0  # seconds
+
+
+def _callback_debounce(key: str) -> bool:
+    """Returns True if this callback should be processed, False if it's a
+    duplicate arriving within the debounce window (Telegram can redeliver
+    callback updates)."""
+    now = time.monotonic()
+    last = _CALLBACK_LOCKS.get(key)
+    _CALLBACK_LOCKS[key] = now
+    if last is not None and (now - last) < _CALLBACK_LOCK_WINDOW:
+        return False
+    return True
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def esc(text: Optional[str]) -> str:
+    return html.escape(text or "")
+
+
+def mention_html(user: User) -> str:
+    name = esc(user.first_name or "User")
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
+def user_full_display(user: User) -> str:
+    name = esc(f"{user.first_name or ''} {user.last_name or ''}".strip() or "User")
+    link = f'<a href="tg://user?id={user.id}">{name}</a>'
+    uname = f"@{esc(user.username)}" if user.username else "NO USERNAME"
+    return f"{link} ({uname})"
+
+
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def fmt_dt(dt: Optional[datetime.datetime]) -> str:
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$", re.IGNORECASE)
+
+
+def parse_duration(text: str) -> Optional[int]:
+    """Parses '10m', '2h', '1d', '30s' -> seconds. Returns None if invalid."""
+    if not text:
+        return None
+    m = _DURATION_RE.match(text.strip())
+    if not m:
+        return None
+    value, unit = int(m.group(1)), m.group(2).lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    seconds = value * mult
+    return seconds if seconds > 0 else None
+
+
+def human_duration(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def safe_username(user_or_none) -> str:
+    if not user_or_none or not getattr(user_or_none, "username", None):
+        return "NO USERNAME"
+    return f"@{user_or_none.username}"
+
+
+async def rpc_guard(coro_fn, *args, retries: int = 1, **kwargs):
+    """Runs a Pyrogram coroutine call, transparently retrying once on
+    FloodWait. Returns (result, error) — error is None on success."""
+    try:
+        return await coro_fn(*args, **kwargs), None
+    except FloodWait as e:
+        wait_for = getattr(e, "value", None) or getattr(e, "x", 5)
+        logger.warning("FloodWait: sleeping for %s seconds", wait_for)
+        await asyncio.sleep(wait_for)
+        if retries > 0:
+            return await rpc_guard(coro_fn, *args, retries=retries - 1, **kwargs)
+        return None, e
+    except RPCError as e:
+        return None, e
+
+
+async def safe_send_message(client: Client, chat_id: int, text: str, **kwargs) -> Optional[Message]:
+    kwargs.setdefault("disable_web_page_preview", True)
+    result, err = await rpc_guard(client.send_message, chat_id, text, **kwargs)
+    if err is not None:
+        if isinstance(err, (ChatWriteForbidden, UserIsBlocked, InputUserDeactivated, PeerIdInvalid, ChannelInvalid)):
+            logger.info("safe_send_message: could not deliver to %s (%s)", chat_id, type(err).__name__)
+        else:
+            logger.warning("safe_send_message error for %s: %s", chat_id, err)
+        return None
+    return result
+
+
+async def safe_edit_message(client: Client, chat_id: int, message_id: int, text: str, **kwargs) -> bool:
+    result, err = await rpc_guard(client.edit_message_text, chat_id, message_id, text, **kwargs)
+    if err is not None:
+        if isinstance(err, (MessageNotModified,)):
+            return True
+        if isinstance(err, (MessageIdInvalid,)):
+            return False
+        logger.warning("safe_edit_message error chat=%s msg=%s: %s", chat_id, message_id, err)
+        return False
+    return True
+
+
+async def safe_edit_reply_markup(client: Client, chat_id: int, message_id: int, markup) -> bool:
+    result, err = await rpc_guard(client.edit_message_reply_markup, chat_id, message_id, markup)
+    if err is not None and not isinstance(err, MessageNotModified):
+        logger.warning("safe_edit_reply_markup error chat=%s msg=%s: %s", chat_id, message_id, err)
+        return False
+    return True
+
+
+async def send_log(client: Client, log_chat_id: Optional[int], text: str, **kwargs):
+    if not log_chat_id:
+        return
+    await safe_send_message(client, log_chat_id, text, **kwargs)
+
+
+# ============================================================
+# PERMISSION HELPERS
+# ============================================================
+async def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+
+async def is_bot_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    doc = await bot_admins_coll.find_one({"user_id": user_id})
+    return doc is not None
+
+
+async def get_chat_member_safe(client: Client, chat_id: int, user_id: int):
+    result, err = await rpc_guard(client.get_chat_member, chat_id, user_id)
+    if err is not None:
+        return None
+    return result
+
+
+async def is_telegram_group_owner(client: Client, chat_id: int, user_id: int) -> bool:
+    member = await get_chat_member_safe(client, chat_id, user_id)
+    return bool(member and member.status == ChatMemberStatus.OWNER)
+
+
+async def is_telegram_group_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    member = await get_chat_member_safe(client, chat_id, user_id)
+    return bool(member and member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR))
+
+
+async def is_authorized_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    """The umbrella check used for every sensitive moderation action:
+    Telegram group admin/owner, this bot's internal admin, or the
+    configured OWNER_ID."""
+    if await is_owner(user_id):
+        return True
+    if await is_bot_admin(user_id):
+        return True
+    return await is_telegram_group_admin(client, chat_id, user_id)
+
+
+async def bot_permissions(client: Client, chat_id: int):
+    """Returns the bot's own ChatMember record in a chat, or None."""
+    me = await client.get_me()
+    return await get_chat_member_safe(client, chat_id, me.id)
+
+
+async def bot_can_restrict(client: Client, chat_id: int) -> bool:
+    member = await bot_permissions(client, chat_id)
+    if not member:
+        return False
+    if member.status == ChatMemberStatus.OWNER:
+        return True
+    priv = getattr(member, "privileges", None)
+    return bool(priv and getattr(priv, "can_restrict_members", False))
+
+
+async def bot_can_invite(client: Client, chat_id: int) -> bool:
+    member = await bot_permissions(client, chat_id)
+    if not member:
+        return False
+    if member.status == ChatMemberStatus.OWNER:
+        return True
+    priv = getattr(member, "privileges", None)
+    return bool(priv and getattr(priv, "can_invite_users", False))
+
+
+async def target_is_protected(client: Client, chat_id: int, target_id: int) -> Optional[str]:
+    """Returns a human-readable reason if `target_id` must NOT be moderated
+    in `chat_id` (bot itself, owner, or another admin), else None."""
+    me = await client.get_me()
+    if target_id == me.id:
+        return "I can't moderate myself."
+    if target_id == OWNER_ID:
+        return "That user is the bot owner and cannot be moderated."
+    member = await get_chat_member_safe(client, chat_id, target_id)
+    if member and member.status == ChatMemberStatus.OWNER:
+        return "That user is the group owner and cannot be moderated."
+    if member and member.status == ChatMemberStatus.ADMINISTRATOR:
+        return "That user is a group administrator. Demote them first if you really want to moderate them."
+    return None
+
+
+# ============================================================
+# USER RESOLUTION
+# ============================================================
+async def resolve_target_user(
+    client: Client, message: Message
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Figures out (target_user_id, target_display_name, reason) from a
+    moderation command's reply / arguments.
+
+    Supports:
+        /cmd                (reply to a message)
+        /cmd <reason...>     (reply to a message, rest is reason)
+        /cmd 123456789 <reason...>
+        /cmd @username <reason...>
+    Returns (None, None, error_message) on failure.
+    """
+    args = message.command[1:] if message.command else []
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        reason = " ".join(args).strip() or None
+        return target.id, (target.first_name or "User"), reason
+
+    if not args:
+        return None, None, (
+            "⚠️ Please reply to a user's message, or provide a numeric User ID "
+            "or @username.\nExample: <code>/ban @username spam</code>"
+        )
+
+    first = args[0]
+    reason = " ".join(args[1:]).strip() or None
+
+    if first.startswith("@"):
+        try:
+            user = await client.get_users(first)
+            return user.id, (user.first_name or "User"), reason
+        except (UsernameNotOccupied, UsernameInvalid, RPCError):
+            return None, None, f"⚠️ Could not resolve username {esc(first)}."
+
+    if first.lstrip("-").isdigit():
+        target_id = int(first)
+        try:
+            user = await client.get_users(target_id)
+            return user.id, (user.first_name or "User"), reason
+        except RPCError:
+            # User may not be resolvable (never seen by the bot) — still
+            # allow moderation by raw ID, Telegram accepts bare IDs.
+            return target_id, str(target_id), reason
+
+    return None, None, (
+        "⚠️ Could not understand the target. Reply to a user, or provide a "
+        "numeric User ID or @username."
+    )
+
+
+# ============================================================
+# GROUP SETTINGS
+# ============================================================
+DEFAULT_SETTINGS = {
+    "join_request_enabled": True,
+    "captcha_enabled": False,
+    "captcha_timeout": DEFAULT_CAPTCHA_TIMEOUT,
+    "captcha_max_attempts": DEFAULT_CAPTCHA_MAX_ATTEMPTS,
+    "captcha_auto_approve": DEFAULT_CAPTCHA_AUTO_APPROVE,
+    "decline_on_captcha_fail": DEFAULT_DECLINE_ON_CAPTCHA_FAIL,
+    "decline_on_captcha_timeout": DEFAULT_DECLINE_ON_CAPTCHA_TIMEOUT,
+    "imposter_enabled": False,
+    "auto_decline_high_risk": False,
+    "log_chat_id": None,
+}
+
+
+async def get_group_settings(chat_id: int) -> dict:
+    doc = await group_settings_coll.find_one({"chat_id": chat_id})
+    if not doc:
+        doc = {"chat_id": chat_id, **DEFAULT_SETTINGS}
+        await group_settings_coll.insert_one(doc)
+        return doc
+    # backfill any keys added in later versions
+    patch = {k: v for k, v in DEFAULT_SETTINGS.items() if k not in doc}
+    if patch:
+        await group_settings_coll.update_one({"chat_id": chat_id}, {"$set": patch})
+        doc.update(patch)
+    return doc
+
+
+async def set_group_settings(chat_id: int, patch: dict) -> dict:
+    doc = await group_settings_coll.find_one_and_update(
+        {"chat_id": chat_id},
+        {"$set": patch, "$setOnInsert": {k: v for k, v in DEFAULT_SETTINGS.items() if k not in patch}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc
+
+
+def tf(v: bool) -> str:
+    return "✅ ON" if v else "🚫 OFF"
+
+
+# ============================================================
+# CLIENT
+# ============================================================
+app = Client(
+    "group_management_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workdir=os.getenv("PYROGRAM_WORKDIR", "."),
+)
+
+
+# ============================================================
+# BOT ADMIN MANAGEMENT
+# ============================================================
+@app.on_message(filters.command("addadmin"))
+async def cmd_addadmin(client: Client, message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.reply_text("❌ Only the bot owner can add bot admins.")
+        return
+
+    target_id, target_name, _ = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(
+            "⚠️ Reply to a user, or use <code>/addadmin &lt;user_id&gt;</code> "
+            "or <code>/addadmin @username</code>."
+        )
+        return
+
+    existing = await bot_admins_coll.find_one({"user_id": target_id})
+    if existing:
+        await message.reply_text("⚠️ That user is already a bot admin.")
+        return
+
+    username = None
+    try:
+        u = await client.get_users(target_id)
+        username = u.username
+        target_name = u.first_name or target_name
+    except RPCError:
+        pass
+
+    await bot_admins_coll.insert_one(
+        {
+            "user_id": target_id,
+            "username": username,
+            "first_name": target_name,
+            "added_by": message.from_user.id,
+            "timestamp": now_utc(),
+        }
+    )
+    logger.info("Bot admin added: %s by %s", target_id, message.from_user.id)
+    await message.reply_text(
+        f"✅ <b>{esc(target_name)}</b> (<code>{target_id}</code>) is now a bot admin."
+    )
+
+
+@app.on_message(filters.command("removeadmin"))
+async def cmd_removeadmin(client: Client, message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.reply_text("❌ Only the bot owner can remove bot admins.")
+        return
+
+    target_id, _, _ = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(
+            "⚠️ Reply to a user, or use <code>/removeadmin &lt;user_id&gt;</code>."
+        )
+        return
+
+    result = await bot_admins_coll.find_one_and_delete({"user_id": target_id})
+    if result:
+        logger.info("Bot admin removed: %s by %s", target_id, message.from_user.id)
+        await message.reply_text(f"✅ Removed <code>{target_id}</code> from bot admins.")
+    else:
+        await message.reply_text("⚠️ That user is not a bot admin.")
+
+
+@app.on_message(filters.command("admins"))
+async def cmd_admins(client: Client, message: Message):
+    lines = [f"👑 <b>OWNER</b>\n<code>{OWNER_ID}</code>\n"]
+    cursor = bot_admins_coll.find({}).sort("timestamp", ASCENDING)
+    admins = [doc async for doc in cursor]
+    if admins:
+        lines.append("🛡 <b>BOT ADMINS</b>")
+        for a in admins:
+            uname = f"@{a['username']}" if a.get("username") else "no username"
+            lines.append(f"• <code>{a['user_id']}</code> — {esc(a.get('first_name') or '')} ({esc(uname)})")
+    else:
+        lines.append("🛡 <b>BOT ADMINS</b>\n<i>None configured yet.</i>")
+
+    if message.chat.type != "private":
+        lines.append("\n👮 <b>TELEGRAM GROUP ADMINS</b>")
+        try:
+            async for m in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.ADMINISTRATORS):
+                if not m.user or m.user.is_bot:
+                    continue
+                tag = "👑" if m.status == ChatMemberStatus.OWNER else "•"
+                lines.append(f"{tag} {mention_html(m.user)} (<code>{m.user.id}</code>)")
+        except RPCError as e:
+            lines.append(f"<i>Could not fetch: {esc(str(e))}</i>")
+
+    await message.reply_text("\n".join(lines))
+
+
+# ============================================================
+# IMPOSTER DETECTION
+# ============================================================
+# ------------------------------------------------------------
+# PROTECTED-USER IMPERSONATION SYSTEM
+# ------------------------------------------------------------
+def _norm(text: Optional[str]) -> str:
+    return (text or "").strip().lower()
+
+
+def _display_name(first: Optional[str], last: Optional[str]) -> str:
+    return f"{first or ''} {last or ''}".strip()
+
+
+async def add_protected_user(chat_id: int, user: User) -> bool:
+    """Adds/refreshes a protected-user record. Returns True if this was a
+    brand-new protection, False if it already existed (and was refreshed)."""
+    now = now_utc()
+    existing = await protected_users_coll.find_one({"chat_id": chat_id, "user_id": user.id})
+    doc = {
+        "chat_id": chat_id,
+        "user_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "updated_at": now,
+    }
+    if existing:
+        await protected_users_coll.update_one({"chat_id": chat_id, "user_id": user.id}, {"$set": doc})
+        return False
+    doc["created_at"] = now
+    await protected_users_coll.insert_one(doc)
+    return True
+
+
+async def remove_protected_user(chat_id: int, user_id: int) -> bool:
+    result = await protected_users_coll.delete_one({"chat_id": chat_id, "user_id": user_id})
+    return result.deleted_count > 0
+
+
+async def is_impersonating_protected(
+    chat_id: int,
+    candidate_id: int,
+    candidate_username: Optional[str],
+    candidate_first: Optional[str],
+    candidate_last: Optional[str],
+) -> Optional[dict]:
+    """Returns the protected-user document `candidate_id` appears to be
+    impersonating, or None. Never flags the protected account itself, is
+    None/case-safe, and only matches on an exact (normalized) username or
+    exact (normalized) full display-name collision to avoid false positives."""
+    cand_uname = _norm(candidate_username)
+    cand_full = _norm(_display_name(candidate_first, candidate_last))
+    if not cand_uname and not cand_full:
+        return None
+    try:
+        cursor = protected_users_coll.find({"chat_id": chat_id})
+        async for p in cursor:
+            if p.get("user_id") == candidate_id:
+                continue
+            p_uname = _norm(p.get("username"))
+            p_full = _norm(_display_name(p.get("first_name"), p.get("last_name")))
+            if cand_uname and p_uname and cand_uname == p_uname:
+                return p
+            if cand_full and p_full and cand_full == p_full:
+                return p
+    except Exception as e:  # never let a DB hiccup crash message/join processing
+        logger.warning("is_impersonating_protected lookup failed for chat %s: %s", chat_id, e)
+        return None
+    return None
+
+
+def _protected_summary(p: dict) -> str:
+    uname = f"@{p['username']}" if p.get("username") else "NO USERNAME"
+    name = esc(_display_name(p.get("first_name"), p.get("last_name")) or "Unknown")
+    return f"{name} ({esc(uname)}, <code>{p.get('user_id')}</code>)"
+
+
+async def _render_protected_page(chat_id: int, page: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    total = await protected_users_coll.count_documents({"chat_id": chat_id})
+    if total == 0:
+        return "🛡 No protected users configured for this group.", None
+    cursor = (
+        protected_users_coll.find({"chat_id": chat_id})
+        .sort("created_at", DESCENDING)
+        .skip(page * PAGE_SIZE)
+        .limit(PAGE_SIZE)
+    )
+    lines = [f"🛡 <b>Protected Users</b> ({total} total)\n"]
+    async for p in cursor:
+        lines.append(f"👤 {_protected_summary(p)}")
+    return "\n".join(lines), _paginate_kb("prc", chat_id, page, total)
+
+
+async def _check_protected_impersonation(client: Client, chat_id: int, user: User) -> Optional[dict]:
+    """Runs the protected-user check for `user` in `chat_id` and, if a match
+    is found, posts a warning using the group's existing log architecture.
+    Returns the matched protected-user doc (or None)."""
+    impersonated = await is_impersonating_protected(
+        chat_id, user.id, user.username, user.first_name, user.last_name
+    )
+    if not impersonated:
+        return None
+    settings = await get_group_settings(chat_id)
+    alert = (
+        "⚠️ <b>POSSIBLE IMPERSONATION</b>\n\n"
+        f"<b>User:</b> {mention_html(user)}\n"
+        f"<b>Username:</b> {esc(safe_username(user))}\n"
+        f"<b>User ID:</b> <code>{user.id}</code>\n\n"
+        f"<b>Possible protected account:</b>\n{_protected_summary(impersonated)}\n\n"
+        "⚠️ Please review this user carefully."
+    )
+    await safe_send_message(client, chat_id, alert)
+    await send_log(client, settings.get("log_chat_id"), alert)
+    logger.info(
+        "Possible impersonation: user %s in chat %s matches protected user %s",
+        user.id, chat_id, impersonated.get("user_id"),
+    )
+    return impersonated
+
+
+@app.on_message(filters.group & filters.command("imposter"))
+async def cmd_imposter(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text(
+            "🎭 <b>Imposter Detection</b>\n\n"
+            "<code>/imposter enable</code> — turn identity-change detection on\n"
+            "<code>/imposter disable</code> — turn it off\n"
+            "<code>/imposter protect</code> — reply to a user to mark them protected\n"
+            "<code>/imposter unprotect &lt;user_id&gt;</code> — remove protection\n"
+            "<code>/imposter protected</code> — list protected users"
+        )
+        return
+
+    sub = message.command[1].lower()
+
+    if sub in ("enable", "disable"):
+        if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+            await message.reply_text("❌ You must be a group admin to change this setting.")
+            return
+        enable = sub == "enable"
+        settings = await get_group_settings(message.chat.id)
+        if settings.get("imposter_enabled") == enable:
+            state = "already enabled" if enable else "already disabled"
+            await message.reply_text(f"⚠️ Imposter detection is {state} for this group.")
+            return
+        await set_group_settings(message.chat.id, {"imposter_enabled": enable})
+        state = "enabled ✅" if enable else "disabled 🚫"
+        await message.reply_text(f"🎭 Imposter detection {state} for <b>{esc(message.chat.title)}</b>.")
+        logger.info("Imposter detection %s for chat %s by %s", state, message.chat.id, message.from_user.id)
+        return
+
+    if sub == "protect":
+        if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+            await message.reply_text("❌ You must be a group admin to change this setting.")
+            return
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply_text(
+                "⚠️ Reply to the user's message you want to protect.\nUsage: <code>/imposter protect</code>"
+            )
+            return
+        target = message.reply_to_message.from_user
+        if target.is_bot:
+            await message.reply_text("⚠️ Bots cannot be added to the protected list.")
+            return
+        is_new = await add_protected_user(message.chat.id, target)
+        prefix = "✅ User has been added to the protected list." if is_new else "ℹ️ Protected-user details refreshed."
+        await message.reply_text(
+            f"{prefix}\n\n"
+            f"<b>Name:</b> {user_full_display(target)}\n"
+            f"<b>Username:</b> {esc(safe_username(target))}\n"
+            f"<b>ID:</b> <code>{target.id}</code>"
+        )
+        logger.info("Protected user %s added in chat %s by %s", target.id, message.chat.id, message.from_user.id)
+        return
+
+    if sub == "unprotect":
+        if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+            await message.reply_text("❌ You must be a group admin to change this setting.")
+            return
+        if len(message.command) < 3 or not message.command[2].lstrip("-").isdigit():
+            await message.reply_text("Usage: <code>/imposter unprotect &lt;user_id&gt;</code>")
+            return
+        target_id = int(message.command[2])
+        removed = await remove_protected_user(message.chat.id, target_id)
+        if removed:
+            await message.reply_text(f"✅ Protection removed for <code>{target_id}</code>.")
+        else:
+            await message.reply_text(f"⚠️ <code>{target_id}</code> was not on the protected list.")
+        return
+
+    if sub == "protected":
+        if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+            await message.reply_text("❌ You must be a group admin to view this.")
+            return
+        text, kb = await _render_protected_page(message.chat.id, 0)
+        await message.reply_text(text, reply_markup=kb)
+        return
+
+    await message.reply_text(
+        "⚠️ Unknown sub-command. Use enable / disable / protect / unprotect / protected."
+    )
+
+
+@app.on_callback_query(filters.regex(r"^prc:-?\d+:\d+$"))
+async def cb_protected_page(client: Client, cq: CallbackQuery):
+    _, chat_id_s, page_s = cq.data.split(":")
+    chat_id, page = int(chat_id_s), int(page_s)
+    if not await is_authorized_admin(client, chat_id, cq.from_user.id):
+        await cq.answer("Admins only.", show_alert=True)
+        return
+    text, kb = await _render_protected_page(chat_id, page)
+    await cq.answer()
+    await safe_edit_message(client, cq.message.chat.id, cq.message.id, text, reply_markup=kb)
+
+
+@app.on_message(filters.group & ~filters.bot & ~filters.via_bot & ~filters.service, group=50)
+async def imposter_watcher(client: Client, message: Message):
+    user = message.from_user
+    if not user or user.is_bot or message.sender_chat:
+        return
+
+    settings = await get_group_settings(message.chat.id)
+    if not settings.get("imposter_enabled"):
+        return
+
+    profile = await user_profiles_coll.find_one({"user_id": user.id})
+    if not profile:
+        await user_profiles_coll.insert_one(
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "updated_at": now_utc(),
+            }
+        )
+    else:
+        old_username = profile.get("username")
+        old_first = profile.get("first_name")
+        old_last = profile.get("last_name")
+
+        changed_blocks = []
+        if old_username != user.username:
+            before = f"@{old_username}" if old_username else "NO USERNAME"
+            after = f"@{user.username}" if user.username else "NO USERNAME"
+            changed_blocks.append(f"🐻 <b>Changed username</b>\nFROM: {esc(before)}\nTO: {esc(after)}")
+        if old_first != user.first_name:
+            before = old_first or "—"
+            after = user.first_name or "—"
+            changed_blocks.append(f"🪧 <b>Changed first name</b>\nFROM: {esc(before)}\nTO: {esc(after)}")
+        if old_last != user.last_name:
+            before = old_last or "NO LAST NAME"
+            after = user.last_name or "NO LAST NAME"
+            changed_blocks.append(f"🪧 <b>Changed last name</b>\nFROM: {esc(before)}\nTO: {esc(after)}")
+
+        if changed_blocks:
+            await user_profiles_coll.update_one(
+                {"user_id": user.id},
+                {
+                    "$set": {
+                        "username": user.username,
+                        "first_name": user.first_name,
+                        "last_name": user.last_name,
+                        "updated_at": now_utc(),
+                    }
+                },
+            )
+
+            text = (
+                "🔓 <b>IMPOSTER / PRETENDER DETECTED</b>\n\n"
+                f"<b>User:</b> {mention_html(user)}\n"
+                f"<b>User ID:</b> <code>{user.id}</code>\n\n" + "\n\n".join(changed_blocks)
+            )
+            await message.reply_text(text, quote=False)
+            logger.info("Imposter change detected for user %s in chat %s", user.id, message.chat.id)
+
+    # Protected-account impersonation check runs independently of whether an
+    # identity change was just detected above (e.g. a brand-new impersonator
+    # account posting for the first time should still be flagged).
+    try:
+        await _check_protected_impersonation(client, message.chat.id, user)
+    except Exception as e:
+        logger.warning("Protected-impersonation check failed for user %s in chat %s: %s", user.id, message.chat.id, e)
+
+
+# ============================================================
+# DECLINED / BANNED USER TRACKING + PAGINATION
+# ============================================================
+PAGE_SIZE = 8
+
+
+async def record_declined(chat_id, user: User, declined_by: int, reason: Optional[str]):
+    await declined_users_coll.insert_one(
+        {
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "declined_by": declined_by,
+            "reason": reason,
+            "timestamp": now_utc(),
+        }
+    )
+
+
+async def record_banned(chat_id, user_id: int, first_name: Optional[str], username: Optional[str],
+                         last_name: Optional[str], banned_by: int, reason: Optional[str]):
+    await banned_users_coll.update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {
+            "$set": {
+                "first_name": first_name,
+                "username": username,
+                "last_name": last_name,
+                "banned_by": banned_by,
+                "reason": reason,
+                "timestamp": now_utc(),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def remove_banned_record(chat_id, user_id: int):
+    await banned_users_coll.delete_one({"chat_id": chat_id, "user_id": user_id})
+
+
+def _paginate_kb(prefix: str, chat_id: int, page: int, total: int) -> Optional[InlineKeyboardMarkup]:
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if total_pages <= 1:
+        return None
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}:{chat_id}:{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}:{chat_id}:{page + 1}"))
+    return InlineKeyboardMarkup([row])
+
+
+async def _render_declined_page(chat_id: int, page: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    total = await declined_users_coll.count_documents({"chat_id": chat_id})
+    if total == 0:
+        return "📋 No declined users recorded for this group.", None
+    cursor = (
+        declined_users_coll.find({"chat_id": chat_id})
+        .sort("timestamp", DESCENDING)
+        .skip(page * PAGE_SIZE)
+        .limit(PAGE_SIZE)
+    )
+    lines = [f"📋 <b>Declined Users</b> ({total} total)\n"]
+    async for d in cursor:
+        uname = f"@{d['username']}" if d.get("username") else "no username"
+        name = esc(f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip() or "Unknown")
+        reason = esc(d.get("reason") or "—")
+        lines.append(
+            f"👤 {name} (<code>{d['user_id']}</code>, {esc(uname)})\n"
+            f"   Declined by: <code>{d.get('declined_by')}</code> | Reason: {reason} | {fmt_dt(d.get('timestamp'))}"
+        )
+    return "\n".join(lines), _paginate_kb("dcl", chat_id, page, total)
+
+
+async def _render_banned_page(chat_id: int, page: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    total = await banned_users_coll.count_documents({"chat_id": chat_id})
+    if total == 0:
+        return "📋 No banned users recorded for this group.", None
+    cursor = (
+        banned_users_coll.find({"chat_id": chat_id})
+        .sort("timestamp", DESCENDING)
+        .skip(page * PAGE_SIZE)
+        .limit(PAGE_SIZE)
+    )
+    lines = [f"📋 <b>Banned Users</b> ({total} total)\n"]
+    async for d in cursor:
+        uname = f"@{d['username']}" if d.get("username") else "no username"
+        name = esc(f"{d.get('first_name') or ''} {d.get('last_name') or ''}".strip() or "Unknown")
+        reason = esc(d.get("reason") or "—")
+        lines.append(
+            f"👤 {name} (<code>{d['user_id']}</code>, {esc(uname)})\n"
+            f"   Banned by: <code>{d.get('banned_by')}</code> | Reason: {reason} | {fmt_dt(d.get('timestamp'))}"
+        )
+    return "\n".join(lines), _paginate_kb("bnd", chat_id, page, total)
+
+
+@app.on_message(filters.group & filters.command(["declined", "declinedusers"]))
+async def cmd_declined(client: Client, message: Message):
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to view this.")
+        return
+    text, kb = await _render_declined_page(message.chat.id, 0)
+    await message.reply_text(text, reply_markup=kb)
+
+
+@app.on_message(filters.group & filters.command(["banned", "bannedusers"]))
+async def cmd_banned(client: Client, message: Message):
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to view this.")
+        return
+    text, kb = await _render_banned_page(message.chat.id, 0)
+    await message.reply_text(text, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^dcl:-?\d+:\d+$"))
+async def cb_declined_page(client: Client, cq: CallbackQuery):
+    _, chat_id_s, page_s = cq.data.split(":")
+    chat_id, page = int(chat_id_s), int(page_s)
+    if not await is_authorized_admin(client, chat_id, cq.from_user.id):
+        await cq.answer("Admins only.", show_alert=True)
+        return
+    text, kb = await _render_declined_page(chat_id, page)
+    await cq.answer()
+    await safe_edit_message(client, cq.message.chat.id, cq.message.id, text, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^bnd:-?\d+:\d+$"))
+async def cb_banned_page(client: Client, cq: CallbackQuery):
+    _, chat_id_s, page_s = cq.data.split(":")
+    chat_id, page = int(chat_id_s), int(page_s)
+    if not await is_authorized_admin(client, chat_id, cq.from_user.id):
+        await cq.answer("Admins only.", show_alert=True)
+        return
+    text, kb = await _render_banned_page(chat_id, page)
+    await cq.answer()
+    await safe_edit_message(client, cq.message.chat.id, cq.message.id, text, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^noop$"))
+async def cb_noop(client: Client, cq: CallbackQuery):
+    await cq.answer()
+
+
+# ============================================================
+# MODERATION — BAN / UNBAN / MUTE / UNMUTE (+ temporary variants)
+# ============================================================
+MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_media_messages=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+    can_send_polls=False,
+    can_change_info=False,
+    can_invite_users=False,
+    can_pin_messages=False,
+)
+
+UNMUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_media_messages=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_send_polls=True,
+    can_invite_users=True,
+)
+
+
+async def _record_temp_action(chat_id, user_id, action, seconds, by, reason):
+    expires_at = now_utc() + datetime.timedelta(seconds=seconds)
+    await temporary_actions_coll.insert_one(
+        {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "action": action,  # "mute" or "ban"
+            "expires_at": expires_at,
+            "created_at": now_utc(),
+            "by": by,
+            "reason": reason,
+            "status": "pending",
+        }
+    )
+    return expires_at
+
+
+async def _clear_temp_actions(chat_id, user_id, action):
+    await temporary_actions_coll.update_many(
+        {"chat_id": chat_id, "user_id": user_id, "action": action, "status": "pending"},
+        {"$set": {"status": "cancelled"}},
+    )
+
+
+def _require_group(message: Message) -> bool:
+    return message.chat.type != "private"
+
+
+async def _guard_moderation(client: Client, message: Message, target_id: int) -> Optional[str]:
+    """Common pre-flight checks for ban/mute commands. Returns an error
+    string to reply with, or None if everything's OK."""
+    if not _require_group(message):
+        return "This command can only be used in groups."
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        return "❌ You must be a group admin to use this."
+    if not await bot_can_restrict(client, message.chat.id):
+        return "❌ I need administrator rights with 'Ban/Restrict users' permission to do this."
+    protection = await target_is_protected(client, message.chat.id, target_id)
+    if protection:
+        return f"❌ {protection}"
+    return None
+
+
+@app.on_message(filters.command("ban"))
+async def cmd_ban(client: Client, message: Message):
+    target_id, target_name, reason = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(target_name or "⚠️ Could not resolve target.")
+        return
+    err = await _guard_moderation(client, message, target_id)
+    if err:
+        await message.reply_text(err)
+        return
+
+    result, rpc_err = await rpc_guard(client.ban_chat_member, message.chat.id, target_id)
+    if rpc_err:
+        await message.reply_text(f"❌ Failed to ban: {esc(str(rpc_err))}")
+        return
+
+    user = None
+    try:
+        user = await client.get_users(target_id)
+    except RPCError:
+        pass
+    await record_banned(
+        message.chat.id, target_id,
+        user.first_name if user else target_name,
+        user.username if user else None,
+        user.last_name if user else None,
+        message.from_user.id, reason,
+    )
+    await _clear_temp_actions(message.chat.id, target_id, "ban")
+
+    txt = f"🔨 <b>{esc(target_name)}</b> (<code>{target_id}</code>) has been banned by {mention_html(message.from_user)}."
+    if reason:
+        txt += f"\nReason: {esc(reason)}"
+    await message.reply_text(txt)
+    logger.info("User %s banned from %s by %s", target_id, message.chat.id, message.from_user.id)
+
+    s = await get_group_settings(message.chat.id)
+    await send_log(client, s.get("log_chat_id"), f"🔨 BAN — {txt}")
+
+
+@app.on_message(filters.command("unban"))
+async def cmd_unban(client: Client, message: Message):
+    target_id, target_name, _ = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(target_name or "⚠️ Could not resolve target.")
+        return
+    if not _require_group(message):
+        await message.reply_text("This command can only be used in groups.")
+        return
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to use this.")
+        return
+    if not await bot_can_restrict(client, message.chat.id):
+        await message.reply_text("❌ I need administrator rights with 'Ban/Restrict users' permission.")
+        return
+
+    result, rpc_err = await rpc_guard(client.unban_chat_member, message.chat.id, target_id)
+    if rpc_err:
+        await message.reply_text(f"❌ Failed to unban: {esc(str(rpc_err))}")
+        return
+
+    await remove_banned_record(message.chat.id, target_id)
+    await _clear_temp_actions(message.chat.id, target_id, "ban")
+
+    txt = f"✅ <b>{esc(target_name)}</b> (<code>{target_id}</code>) has been unbanned by {mention_html(message.from_user)}."
+    await message.reply_text(txt)
+    logger.info("User %s unbanned from %s by %s", target_id, message.chat.id, message.from_user.id)
+    s = await get_group_settings(message.chat.id)
+    await send_log(client, s.get("log_chat_id"), f"✅ UNBAN — {txt}")
+
+
+@app.on_message(filters.command("mute"))
+async def cmd_mute(client: Client, message: Message):
+    target_id, target_name, reason = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(target_name or "⚠️ Could not resolve target.")
+        return
+    err = await _guard_moderation(client, message, target_id)
+    if err:
+        await message.reply_text(err)
+        return
+
+    result, rpc_err = await rpc_guard(client.restrict_chat_member, message.chat.id, target_id, MUTE_PERMISSIONS)
+    if rpc_err:
+        await message.reply_text(f"❌ Failed to mute: {esc(str(rpc_err))}")
+        return
+
+    txt = f"🤐 <b>{esc(target_name)}</b> (<code>{target_id}</code>) has been muted by {mention_html(message.from_user)}."
+    if reason:
+        txt += f"\nReason: {esc(reason)}"
+    await message.reply_text(txt)
+    logger.info("User %s muted in %s by %s", target_id, message.chat.id, message.from_user.id)
+    s = await get_group_settings(message.chat.id)
+    await send_log(client, s.get("log_chat_id"), f"🤐 MUTE — {txt}")
+
+
+@app.on_message(filters.command("unmute"))
+async def cmd_unmute(client: Client, message: Message):
+    target_id, target_name, _ = await resolve_target_user(client, message)
+    if target_id is None:
+        await message.reply_text(target_name or "⚠️ Could not resolve target.")
+        return
+    if not _require_group(message):
+        await message.reply_text("This command can only be used in groups.")
+        return
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to use this.")
+        return
+    if not await bot_can_restrict(client, message.chat.id):
+        await message.reply_text("❌ I need administrator rights with 'Ban/Restrict users' permission.")
+        return
+
+    result, rpc_err = await rpc_guard(client.restrict_chat_member, message.chat.id, target_id, UNMUTE_PERMISSIONS)
+    if rpc_err:
+        await message.reply_text(f"❌ Failed to unmute: {esc(str(rpc_err))}")
+        return
+
+    await _clear_temp_actions(message.chat.id, target_id, "mute")
+    txt = f"🔊 <b>{esc(target_name)}</b> (<code>{target_id}</code>) has been unmuted by {mention_html(message.from_user)}."
+    await message.reply_text(txt)
+    logger.info("User %s unmuted in %s by %s", target_id, message.chat.id, message.from_user.id)
+    s = await get_group_settings(message.chat.id)
+    await send_log(client, s.get("log_chat_id"), f"🔊 UNMUTE — {txt}")
+
+
+async def _do_temp(client: Client, message: Message, action: str):
+    args = message.command[1:] if message.command else []
+    duration_seconds = None
+    reason_start = 0
+
+    # duration can be the first arg (reply-based) or the second (id/@user based)
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        target_id, target_name = target.id, (target.first_name or "User")
+        if args:
+            duration_seconds = parse_duration(args[0])
+            reason_start = 1 if duration_seconds else 0
+    else:
+        if len(args) < 2:
+            await message.reply_text(
+                f"⚠️ Usage: <code>/{action} @user 10m</code> or reply with "
+                f"<code>/{action} 2h</code>."
+            )
+            return
+        first = args[0]
+        if first.startswith("@"):
+            try:
+                user = await client.get_users(first)
+                target_id, target_name = user.id, (user.first_name or "User")
+            except RPCError:
+                await message.reply_text(f"⚠️ Could not resolve username {esc(first)}.")
+                return
+        elif first.lstrip("-").isdigit():
+            target_id = int(first)
+            try:
+                user = await client.get_users(target_id)
+                target_name = user.first_name or str(target_id)
+            except RPCError:
+                target_name = str(target_id)
+        else:
+            await message.reply_text("⚠️ First argument must be a user (reply, @username, or numeric ID).")
+            return
+        duration_seconds = parse_duration(args[1]) if len(args) > 1 else None
+        reason_start = 2
+
+    if not duration_seconds:
+        await message.reply_text(
+            "⚠️ Please provide a valid duration, e.g. <code>10m</code>, <code>2h</code>, <code>1d</code>."
+        )
+        return
+
+    reason = " ".join(args[reason_start:]).strip() or None
+
+    err = await _guard_moderation(client, message, target_id)
+    if err:
+        await message.reply_text(err)
+        return
+
+    if action == "tmute":
+        result, rpc_err = await rpc_guard(
+            client.restrict_chat_member, message.chat.id, target_id, MUTE_PERMISSIONS,
+            until_date=now_utc() + datetime.timedelta(seconds=duration_seconds),
+        )
+        verb, emoji = "muted", "🤐"
+    else:
+        result, rpc_err = await rpc_guard(
+            client.ban_chat_member, message.chat.id, target_id,
+            until_date=now_utc() + datetime.timedelta(seconds=duration_seconds),
+        )
+        verb, emoji = "banned", "🔨"
+
+    if rpc_err:
+        await message.reply_text(f"❌ Failed: {esc(str(rpc_err))}")
+        return
+
+    expires_at = await _record_temp_action(
+        message.chat.id, target_id, "mute" if action == "tmute" else "ban",
+        duration_seconds, message.from_user.id, reason,
+    )
+    if action == "tban":
+        await record_banned(message.chat.id, target_id, target_name, None, None, message.from_user.id, reason)
+
+    txt = (
+        f"{emoji} <b>{esc(target_name)}</b> (<code>{target_id}</code>) has been temporarily {verb} "
+        f"for {human_duration(duration_seconds)} by {mention_html(message.from_user)}.\n"
+        f"Expires: {fmt_dt(expires_at)}"
+    )
+    if reason:
+        txt += f"\nReason: {esc(reason)}"
+    await message.reply_text(txt)
+    logger.info(
+        "Temp %s: user %s in %s for %ss by %s", action, target_id, message.chat.id, duration_seconds,
+        message.from_user.id,
+    )
+    s = await get_group_settings(message.chat.id)
+    await send_log(client, s.get("log_chat_id"), f"{emoji} {action.upper()} — {txt}")
+
+
+@app.on_message(filters.command("tmute"))
+async def cmd_tmute(client: Client, message: Message):
+    await _do_temp(client, message, "tmute")
+
+
+@app.on_message(filters.command("tban"))
+async def cmd_tban(client: Client, message: Message):
+    await _do_temp(client, message, "tban")
+
+
+async def temp_action_sweeper():
+    """Periodically reverses expired temporary mutes/bans. Because this
+    reads directly from MongoDB every cycle (rather than relying on
+    per-action asyncio.sleep() tasks), it is fully restart-safe: on
+    startup this loop simply resumes finding and processing any actions
+    whose expiry has already passed or is coming up."""
+    while True:
+        try:
+            cursor = temporary_actions_coll.find({"status": "pending", "expires_at": {"$lte": now_utc()}})
+            async for action in cursor:
+                chat_id, user_id = action["chat_id"], action["user_id"]
+                try:
+                    if action["action"] == "mute":
+                        await app.restrict_chat_member(chat_id, user_id, UNMUTE_PERMISSIONS)
+                        logger.info("Auto-unmuted %s in %s (temp action expired)", user_id, chat_id)
+                    else:
+                        await app.unban_chat_member(chat_id, user_id)
+                        await remove_banned_record(chat_id, user_id)
+                        logger.info("Auto-unbanned %s in %s (temp action expired)", user_id, chat_id)
+                except RPCError as e:
+                    logger.warning("temp_action_sweeper: failed to reverse action for %s in %s: %s",
+                                    user_id, chat_id, e)
+                await temporary_actions_coll.update_one({"_id": action["_id"]}, {"$set": {"status": "done"}})
+        except Exception:
+            logger.exception("temp_action_sweeper crashed unexpectedly; continuing loop")
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+
+# ============================================================
+# CAPTCHA
+# ============================================================
+def generate_captcha() -> Tuple[str, int, List[int]]:
+    """Returns (question, correct_answer, [option1, option2, option3])."""
+    a, b = random.randint(1, 20), random.randint(1, 20)
+    op = random.choice(["+", "-"])
+    if op == "-" and a < b:
+        a, b = b, a
+    correct = a + b if op == "+" else a - b
+    question = f"What is {a} {op} {b} ?"
+
+    options = {correct}
+    while len(options) < 3:
+        delta = random.choice([-3, -2, -1, 1, 2, 3])
+        candidate = correct + delta
+        options.add(candidate)
+    options = list(options)
+    random.shuffle(options)
+    return question, correct, options
+
+
+def _captcha_kb(token: str, options: List[int]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(str(o), callback_data=f"cap:{token}:{o}") for o in options]]
+    )
+
+
+async def create_captcha_session(chat_id: int, user_id: int, settings: dict) -> dict:
+    question, correct, options = generate_captcha()
+    token = uuid.uuid4().hex[:16]
+    doc = {
+        "token": token,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "challenge": question,
+        "correct_answer": correct,
+        "options": options,
+        "attempts": 0,
+        "max_attempts": settings.get("captcha_max_attempts", DEFAULT_CAPTCHA_MAX_ATTEMPTS),
+        "expires_at": now_utc() + datetime.timedelta(seconds=settings.get("captcha_timeout", DEFAULT_CAPTCHA_TIMEOUT)),
+        "created_at": now_utc(),
+        "status": "pending",  # pending -> verified | failed | expired
+        "user_msg": None,     # [chat_id, message_id] of the PM'd challenge
+    }
+    await captcha_sessions_coll.insert_one(doc)
+    return doc
+
+
+async def send_captcha_challenge(client: Client, requester: User, chat: Chat, session: dict) -> bool:
+    kb = _captcha_kb(session["token"], session["options"])
+    text = (
+        "🛡 <b>GROUP VERIFICATION</b>\n\n"
+        f"Welcome! Before your join request to <b>{esc(chat.title or str(chat.id))}</b> can be "
+        f"approved, please complete the verification below.\n\n"
+        f"<b>{esc(session['challenge'])}</b>\n\n"
+        f"You have {session['max_attempts']} attempt(s), "
+        f"expiring in {human_duration(int((session['expires_at'] - now_utc()).total_seconds()))}."
+    )
+    sent = await safe_send_message(client, requester.id, text, reply_markup=kb)
+    if sent:
+        await captcha_sessions_coll.update_one(
+            {"token": session["token"]}, {"$set": {"user_msg": [sent.chat.id, sent.id]}}
+        )
+        return True
+    return False
+
+
+async def _finish_captcha_message(client: Client, session: dict, text: str):
+    user_msg = session.get("user_msg")
+    if user_msg:
+        await safe_edit_message(client, user_msg[0], user_msg[1], text)
+
+
+@app.on_callback_query(filters.regex(r"^cap:[0-9a-f]{16}:-?\d+$"))
+async def cb_captcha_answer(client: Client, cq: CallbackQuery):
+    if not _callback_debounce(f"cap:{cq.from_user.id}:{cq.data}"):
+        await cq.answer()
+        return
+
+    _, token, answer_s = cq.data.split(":")
+    answer = int(answer_s)
+
+    session = await captcha_sessions_coll.find_one({"token": token})
+    if not session:
+        await cq.answer("This verification session no longer exists.", show_alert=True)
+        return
+
+    # Strict binding: only the intended user, in their own PM, may answer.
+    if cq.from_user.id != session["user_id"]:
+        await cq.answer("This verification is not for you.", show_alert=True)
+        return
+
+    if session["status"] != "pending":
+        await cq.answer("This verification has already been resolved.", show_alert=True)
+        return
+
+    if now_utc() > session["expires_at"]:
+        await cq.answer("⏰ This verification has expired.", show_alert=True)
+        await _handle_captcha_expired(client, session)
+        return
+
+    chat_id, user_id = session["chat_id"], session["user_id"]
+
+    if answer == session["correct_answer"]:
+        await captcha_sessions_coll.update_one({"token": token}, {"$set": {"status": "verified"}})
+        await cq.answer("✅ Verified!", show_alert=False)
+        await safe_edit_message(
+            client, cq.message.chat.id, cq.message.id,
+            "✅ <b>Verification successful!</b>\n\nYour join request is being processed.",
+        )
+        await _on_captcha_verified(client, chat_id, user_id)
+        return
+
+    attempts = session["attempts"] + 1
+    max_attempts = session["max_attempts"]
+    if attempts >= max_attempts:
+        await captcha_sessions_coll.update_one(
+            {"token": token}, {"$set": {"status": "failed", "attempts": attempts}}
+        )
+        await cq.answer("❌ Verification failed.", show_alert=True)
+        await safe_edit_message(
+            client, cq.message.chat.id, cq.message.id,
+            "❌ <b>Verification failed.</b>\n\nYou ran out of attempts.",
+        )
+        await _on_captcha_failed(client, chat_id, user_id)
+    else:
+        remaining = max_attempts - attempts
+        # generate a fresh challenge to avoid trivial retry-guessing
+        question, correct, options = generate_captcha()
+        await captcha_sessions_coll.update_one(
+            {"token": token},
+            {"$set": {"attempts": attempts, "challenge": question, "correct_answer": correct, "options": options}},
+        )
+        await cq.answer(f"❌ Incorrect. Attempts remaining: {remaining}", show_alert=True)
+        await safe_edit_message(
+            client, cq.message.chat.id, cq.message.id,
+            f"🛡 <b>GROUP VERIFICATION</b>\n\n❌ Incorrect answer. Attempts remaining: {remaining}\n\n"
+            f"<b>{esc(question)}</b>",
+            reply_markup=_captcha_kb(token, options),
+        )
+
+
+async def _on_captcha_verified(client: Client, chat_id: int, user_id: int):
+    settings = await get_group_settings(chat_id)
+    await _update_card_captcha_status(client, chat_id, user_id, "✅ CAPTCHA VERIFIED")
+    if settings.get("captcha_auto_approve", True):
+        await _perform_join_action(client, chat_id, user_id, "approve", None, auto=True)
+
+
+async def _handle_captcha_expired(client: Client, session: dict):
+    await captcha_sessions_coll.update_one({"token": session["token"]}, {"$set": {"status": "expired"}})
+    await _finish_captcha_message(
+        client, session, "⏰ <b>Verification expired.</b>\n\nYour join request was not approved."
+    )
+    await _on_captcha_failed(client, session["chat_id"], session["user_id"], expired=True)
+
+
+async def _on_captcha_failed(client: Client, chat_id: int, user_id: int, expired: bool = False):
+    settings = await get_group_settings(chat_id)
+    should_decline = settings.get("decline_on_captcha_timeout" if expired else "decline_on_captcha_fail", True)
+    status_label = "⏰ CAPTCHA EXPIRED" if expired else "❌ CAPTCHA FAILED"
+    await _update_card_captcha_status(client, chat_id, user_id, status_label)
+    if should_decline:
+        await _perform_join_action(client, chat_id, user_id, "decline", None, auto=True)
+
+
+async def captcha_sweeper():
+    """Reconciles expired-but-not-yet-processed captcha sessions. Runs
+    continuously so a bot restart never leaves a session stuck forever."""
+    while True:
+        try:
+            cursor = captcha_sessions_coll.find({"status": "pending", "expires_at": {"$lte": now_utc()}})
+            async for session in cursor:
+                await _handle_captcha_expired(app, session)
+        except Exception:
+            logger.exception("captcha_sweeper crashed unexpectedly; continuing loop")
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+
+# ============================================================
+# JOIN REQUEST HANDLERS
+# ============================================================
+def make_request_buttons(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🍏 APPROVE", callback_data=f"jr:approve:{chat_id}:{user_id}"),
+                InlineKeyboardButton("🍎 DECLINE", callback_data=f"jr:decline:{chat_id}:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🤐 MUTE", callback_data=f"jr:mute:{chat_id}:{user_id}"),
+                InlineKeyboardButton("🔨 BAN", callback_data=f"jr:ban:{chat_id}:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("🔻 DECLINE WITH REASON", callback_data=f"jr:reason:{chat_id}:{user_id}"),
+            ],
+        ]
+    )
+
+
+def _register_card(chat_id: int, user_id: int, location_id: int, message_id: int):
+    PENDING_REQUEST_MSGS.setdefault((chat_id, user_id), {})[location_id] = message_id
+
+
+def _card_locations(chat_id: int, user_id: int) -> Dict[int, int]:
+    return PENDING_REQUEST_MSGS.get((chat_id, user_id), {})
+
+
+async def _close_cards(client: Client, chat_id: int, user_id: int, resolved_text: str):
+    locations = PENDING_REQUEST_MSGS.pop((chat_id, user_id), {})
+    for location_id, msg_id in locations.items():
+        await safe_edit_message(client, location_id, msg_id, resolved_text)
+
+
+def _build_card_text(chat: Chat, requester: User, status_line: Optional[str] = None) -> str:
+    lines = [
+        "🚨 <b>New Join Request</b>\n",
+        f"<b>Name:</b> {user_full_display(requester)}",
+        f"<b>Username:</b> {safe_username(requester)}",
+        f"<b>User ID:</b> <code>{requester.id}</code>",
+        f"<b>Group:</b> {esc(chat.title or str(chat.id))} (<code>{chat.id}</code>)",
+        f"<b>Date:</b> {fmt_dt(now_utc())}",
+    ]
+    if status_line:
+        lines.append(f"\n{status_line}")
+    return "\n".join(lines)
+
+
+async def _update_card_captcha_status(client: Client, chat_id: int, user_id: int, status_line: str):
+    locations = _card_locations(chat_id, user_id)
+    if not locations:
+        return
+    try:
+        chat = await client.get_chat(chat_id)
+    except RPCError:
+        chat = None
+    try:
+        requester = await client.get_users(user_id)
+    except RPCError:
+        requester = None
+    if not chat or not requester:
+        return
+    text = _build_card_text(chat, requester, status_line=f"🛡 <b>Status:</b> {status_line}")
+    kb = make_request_buttons(chat_id, user_id)
+    for location_id, msg_id in locations.items():
+        await safe_edit_message(client, location_id, msg_id, text, reply_markup=kb)
+
+
+async def _high_risk_join_alert(chat: Chat, requester: User, impersonated: dict) -> str:
+    return (
+        "⚠️ <b>HIGH-RISK JOIN REQUEST</b>\n\n"
+        "Possible impersonation detected.\n\n"
+        f"<b>User:</b>\n"
+        f"Name: {esc(_display_name(requester.first_name, requester.last_name)) or 'Unknown'}\n"
+        f"Username: {esc(safe_username(requester))}\n"
+        f"User ID: <code>{requester.id}</code>\n\n"
+        f"<b>Possible protected account:</b>\n"
+        f"Name: {esc(_display_name(impersonated.get('first_name'), impersonated.get('last_name'))) or 'Unknown'}\n"
+        f"Username: {esc((f'@' + impersonated['username']) if impersonated.get('username') else 'NO USERNAME')}\n"
+        f"User ID: <code>{impersonated.get('user_id')}</code>\n\n"
+        "⚠️ Please review this request carefully."
+    )
+
+
+@app.on_chat_join_request()
+async def on_chat_join_request(client: Client, req: ChatJoinRequest):
+    chat = req.chat
+    requester = req.from_user
+    chat_id, user_id = chat.id, requester.id
+
+    settings = await get_group_settings(chat_id)
+    if not settings.get("join_request_enabled", True):
+        return
+
+    status_line = None
+
+    # Protected-user impersonation check, run before CAPTCHA / admin cards.
+    if settings.get("imposter_enabled"):
+        try:
+            impersonated = await is_impersonating_protected(
+                chat_id, requester.id, requester.username, requester.first_name, requester.last_name
+            )
+        except Exception as e:
+            logger.warning("Join-request impersonation check failed for %s/%s: %s", chat_id, user_id, e)
+            impersonated = None
+
+        if impersonated:
+            alert = await _high_risk_join_alert(chat, requester, impersonated)
+            await safe_send_message(client, chat_id, alert)
+            await send_log(client, settings.get("log_chat_id"), alert)
+            logger.info(
+                "High-risk join request: user %s in chat %s matches protected user %s",
+                user_id, chat_id, impersonated.get("user_id"),
+            )
+            if settings.get("auto_decline_high_risk"):
+                result, err = await rpc_guard(client.decline_chat_join_request, chat_id, user_id)
+                if err is None:
+                    await send_log(
+                        client, settings.get("log_chat_id"),
+                        f"🍎 <b>AUTO-DECLINED</b> high-risk join request for <code>{user_id}</code> "
+                        f"in <b>{esc(chat.title or str(chat_id))}</b>.",
+                    )
+                    logger.info("Auto-declined high-risk join request for %s in chat %s", user_id, chat_id)
+                    return
+                logger.warning("Auto-decline failed for %s/%s: %s — falling back to normal flow", chat_id, user_id, err)
+            status_line = "⚠️ <b>Possible impersonation</b> of a protected account — review carefully."
+
+    if settings.get("captcha_enabled"):
+        session = await create_captcha_session(chat_id, user_id, settings)
+        delivered = await send_captcha_challenge(client, requester, chat, session)
+        captcha_line = (
+            "Waiting for CAPTCHA verification (sent to user's PM)."
+            if delivered
+            else "CAPTCHA could not be delivered (user has not started the bot in PM). "
+                 "An admin must verify/approve manually."
+        )
+        status_line = f"{status_line}\n{captcha_line}" if status_line else captcha_line
+
+    if status_line:
+        status_line = f"🛡 <b>Status:</b> {status_line}"
+
+    admins: List[User] = []
+    try:
+        async for m in client.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
+            if m.user and not m.user.is_bot:
+                admins.append(m.user)
+    except RPCError as e:
+        logger.warning("Could not fetch admins for chat %s: %s", chat_id, e)
+
+    card_text = _build_card_text(chat, requester, status_line=status_line)
+    kb = make_request_buttons(chat_id, user_id)
+
+    group_msg = await safe_send_message(client, chat_id, card_text, reply_markup=kb)
+    if group_msg:
+        _register_card(chat_id, user_id, chat_id, group_msg.id)
+
+    delivered_to = 0
+    for admin in admins:
+        sent = await safe_send_message(client, admin.id, card_text, reply_markup=kb)
+        if sent:
+            _register_card(chat_id, user_id, admin.id, sent.id)
+            delivered_to += 1
+
+    await send_log(
+        client, settings.get("log_chat_id"),
+        f"🚨 New join request in <b>{esc(chat.title or str(chat_id))}</b> from "
+        f"{user_full_display(requester)} — routed to {delivered_to}/{len(admins)} admin PM(s).",
+    )
+    logger.info("Join request from %s for chat %s (captcha=%s)", user_id, chat_id, settings.get("captcha_enabled"))
+
+
+async def _perform_join_action(client: Client, chat_id: int, user_id: int, action: str,
+                                actor: Optional[User], auto: bool = False):
+    """Shared implementation for approve/decline/mute/ban, callable either
+    from an admin button click or automatically (e.g. after CAPTCHA)."""
+    actor_label = mention_html(actor) if actor else "🛡 automatic CAPTCHA flow"
+    settings = await get_group_settings(chat_id)
+
+    try:
+        if action == "approve":
+            await client.approve_chat_join_request(chat_id, user_id)
+            resolved = f"🍏 <b>APPROVED</b>\n\nApproved by: {actor_label}\nUser: <code>{user_id}</code>"
+        elif action == "decline":
+            await client.decline_chat_join_request(chat_id, user_id)
+            resolved = f"🍎 <b>DECLINED</b>\n\nDeclined by: {actor_label}\nUser: <code>{user_id}</code>"
+            try:
+                user = await client.get_users(user_id)
+                await record_declined(chat_id, user, actor.id if actor else 0, None)
+            except RPCError:
+                pass
+        elif action == "mute":
+            await client.approve_chat_join_request(chat_id, user_id)
+            await client.restrict_chat_member(chat_id, user_id, MUTE_PERMISSIONS)
+            resolved = f"🤐 <b>APPROVED &amp; MUTED</b>\n\nBy: {actor_label}\nUser: <code>{user_id}</code>"
+        elif action == "ban":
+            await client.approve_chat_join_request(chat_id, user_id)
+            await client.ban_chat_member(chat_id, user_id)
+            try:
+                user = await client.get_users(user_id)
+                await record_banned(chat_id, user_id, user.first_name, user.username, user.last_name,
+                                     actor.id if actor else 0, None)
+            except RPCError:
+                await record_banned(chat_id, user_id, str(user_id), None, None, actor.id if actor else 0, None)
+            resolved = f"🔨 <b>APPROVED &amp; BANNED</b>\n\nBy: {actor_label}\nUser: <code>{user_id}</code>"
+        else:
+            return
+    except RPCError as e:
+        logger.warning("_perform_join_action(%s) failed for %s/%s: %s", action, chat_id, user_id, e)
+        if not auto:
+            raise
+        await _close_cards(
+            client, chat_id, user_id,
+            f"⚠️ Automatic action '{action}' failed for <code>{user_id}</code>: {esc(str(e))}",
+        )
+        return
+
+    await _close_cards(client, chat_id, user_id, resolved)
+    await send_log(
+        client, settings.get("log_chat_id"),
+        f"{resolved}\nGroup: <code>{chat_id}</code>",
+    )
+    logger.info("Join request %s for user %s in chat %s (actor=%s)", action, user_id, chat_id,
+                actor.id if actor else "auto")
+
+
+@app.on_callback_query(filters.regex(r"^jr:(approve|decline|mute|ban):-?\d+:\d+$"))
+async def cb_join_action(client: Client, cq: CallbackQuery):
+    _, action, chat_id_s, user_id_s = cq.data.split(":")
+    chat_id, user_id = int(chat_id_s), int(user_id_s)
+    caller = cq.from_user
+
+    if not _callback_debounce(f"jr:{caller.id}:{action}:{chat_id}:{user_id}"):
+        await cq.answer()
+        return
+
+    if not await is_authorized_admin(client, chat_id, caller.id):
+        await cq.answer("Only group admins can perform this action.", show_alert=True)
+        return
+
+    if (chat_id, user_id) not in PENDING_REQUEST_MSGS:
+        await cq.answer("This request has already been handled.", show_alert=True)
+        return
+
+    if not await bot_can_invite(client, chat_id):
+        await cq.answer("I need admin rights with 'Add users' permission to manage join requests.", show_alert=True)
+        return
+
+    try:
+        await _perform_join_action(client, chat_id, user_id, action, caller, auto=False)
+        labels = {"approve": "User approved.", "decline": "User declined.",
+                  "mute": "User approved and muted.", "ban": "User approved and banned."}
+        await cq.answer(labels.get(action, "Done."), show_alert=False)
+    except RPCError as e:
+        await cq.answer(f"Failed: {e}", show_alert=True)
+
+
+@app.on_callback_query(filters.regex(r"^jr:reason:-?\d+:\d+$"))
+async def cb_join_reason_prompt(client: Client, cq: CallbackQuery):
+    _, _, chat_id_s, user_id_s = cq.data.split(":")
+    chat_id, user_id = int(chat_id_s), int(user_id_s)
+    caller = cq.from_user
+
+    if not await is_authorized_admin(client, chat_id, caller.id):
+        await cq.answer("Only group admins can perform this action.", show_alert=True)
+        return
+    if (chat_id, user_id) not in PENDING_REQUEST_MSGS:
+        await cq.answer("This request has already been handled.", show_alert=True)
+        return
+
+    PENDING_REASON_PROMPTS[caller.id] = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "expires_at": now_utc() + datetime.timedelta(minutes=5),
+    }
+    sent = await safe_send_message(
+        client, caller.id,
+        f"You chose to decline user <code>{user_id}</code> from chat <code>{chat_id}</code> "
+        f"with a reason.\nPlease send me the reason now (5 minute window).",
+    )
+    if sent:
+        await cq.answer("Check your PM to enter the reason.", show_alert=True)
+    else:
+        await cq.answer("Please start the bot in private first, then try again.", show_alert=True)
+
+
+@app.on_message(filters.private & ~filters.bot, group=90)
+async def private_reason_handler(client: Client, message: Message):
+    admin_id = message.from_user.id
+    state = PENDING_REASON_PROMPTS.get(admin_id)
+    if not state:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    if now_utc() > state["expires_at"]:
+        PENDING_REASON_PROMPTS.pop(admin_id, None)
+        await message.reply_text("❌ Session expired. Please click the button again.")
+        return
+
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.reply_text("Please send a valid non-empty text reason.")
+        return
+
+    chat_id, user_id = state["chat_id"], state["user_id"]
+    if (chat_id, user_id) not in PENDING_REQUEST_MSGS:
+        PENDING_REASON_PROMPTS.pop(admin_id, None)
+        await message.reply_text("This request was already handled by another admin.")
+        return
+
+    result, rpc_err = await rpc_guard(client.decline_chat_join_request, chat_id, user_id)
+    PENDING_REASON_PROMPTS.pop(admin_id, None)
+    if rpc_err:
+        await message.reply_text(f"❌ Failed to decline: {esc(str(rpc_err))}")
+        return
+
+    try:
+        user = await client.get_users(user_id)
+        await record_declined(chat_id, user, admin_id, reason)
+    except RPCError:
+        pass
+
+    resolved = (
+        f"🍎 <b>DECLINED WITH REASON</b>\n\nBy: {mention_html(message.from_user)}\n"
+        f"User: <code>{user_id}</code>\nReason: {esc(reason)}"
+    )
+    await _close_cards(client, chat_id, user_id, resolved)
+    await safe_send_message(client, user_id, f"❌ Your join request was declined.\n\nReason:\n{esc(reason)}")
+
+    settings = await get_group_settings(chat_id)
+    await send_log(client, settings.get("log_chat_id"), f"{resolved}\nGroup: <code>{chat_id}</code>")
+    await message.reply_text("✅ Declined with reason sent.")
+    logger.info("Join request declined-with-reason for %s in %s by %s", user_id, chat_id, admin_id)
+
+
+@app.on_message(filters.command(["approveall"]) & filters.group)
+async def cmd_approve_all(client: Client, message: Message):
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to use this.")
+        return
+    result, rpc_err = await rpc_guard(client.approve_all_chat_join_requests, message.chat.id)
+    if rpc_err or not result:
+        await message.reply_text(f"❌ Failed: {esc(str(rpc_err)) if rpc_err else 'no permission?'}")
+        return
+    keys = [k for k in list(PENDING_REQUEST_MSGS.keys()) if k[0] == message.chat.id]
+    for key in keys:
+        await _close_cards(client, key[0], key[1], "✅ Bulk-approved by an admin.")
+    await message.reply_text("✅ All pending join requests approved.")
+    logger.info("Bulk approve-all for chat %s by %s", message.chat.id, message.from_user.id)
+
+
+@app.on_message(filters.command(["rejectall", "declineall"]) & filters.group)
+async def cmd_reject_all(client: Client, message: Message):
+    if not await is_authorized_admin(client, message.chat.id, message.from_user.id):
+        await message.reply_text("❌ You must be a group admin to use this.")
+        return
+    count = 0
+    try:
+        reqs = [r async for r in client.get_chat_join_requests(message.chat.id)]
+        for r in reqs:
+            _, rpc_err = await rpc_guard(client.decline_chat_join_request, message.chat.id, r.from_user.id)
+            if not rpc_err:
+                count += 1
+                await record_declined(message.chat.id, r.from_user, message.from_user.id, "bulk reject")
+    except RPCError as e:
+        await message.reply_text(f"❌ Error: {esc(str(e))}")
+        return
+    keys = [k for k in list(PENDING_REQUEST_MSGS.keys()) if k[0] == message.chat.id]
+    for key in keys:
+        await _close_cards(client, key[0], key[1], "🍎 Bulk-declined by an admin.")
+    await message.reply_text(f"🍎 Declined {count} pending join request(s).")
+    logger.info("Bulk reject-all (%s) for chat %s by %s", count, message.chat.id, message.from_user.id)
+
+
+# ============================================================
+# /joinreq SETTINGS MENU
+# ============================================================
+def _settings_kb(chat_id: int, s: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"🍏 Join Requests: {tf(s.get('join_request_enabled'))}",
+                                   callback_data=f"jrs:toggle_jr:{chat_id}")],
+            [InlineKeyboardButton(f"🛡 CAPTCHA: {tf(s.get('captcha_enabled'))}",
+                                   callback_data=f"jrs:toggle_captcha:{chat_id}")],
+            [InlineKeyboardButton(f"⚡ CAPTCHA Auto-approve: {tf(s.get('captcha_auto_approve'))}",
+                                   callback_data=f"jrs:toggle_auto:{chat_id}")],
+            [InlineKeyboardButton(f"🎭 Imposter Detection: {tf(s.get('imposter_enabled'))}",
+                                   callback_data=f"jrs:toggle_imposter:{chat_id}")],
+            [InlineKeyboardButton(f"⚠️ Auto-decline Impersonators: {tf(s.get('auto_decline_high_risk'))}",
+                                   callback_data=f"jrs:toggle_auto_decline:{chat_id}")],
+            [InlineKeyboardButton("📋 Set Log Chat (reply in PM)", callback_data=f"jrs:set_log:{chat_id}"),
+             InlineKeyboardButton("🗑 Clear Log", callback_data=f"jrs:clear_log:{chat_id}")],
+        ]
+    )
+
+
+def _settings_text(chat: Chat, s: dict) -> str:
+    return (
+        f"⚙️ <b>Join Request Settings</b>\n<b>{esc(chat.title or str(chat.id))}</b>\n\n"
+        f"🍏 Join Requests: <code>{s.get('join_request_enabled')}</code>\n"
+        f"🛡 CAPTCHA: <code>{s.get('captcha_enabled')}</code>\n"
+        f"⚡ CAPTCHA Auto-approve: <code>{s.get('captcha_auto_approve')}</code>\n"
+        f"🎭 Imposter Detection: <code>{s.get('imposter_enabled')}</code>\n"
+        f"⚠️ Auto-decline Impersonators: <code>{s.get('auto_decline_high_risk')}</code>\n"
+        f"📋 Log Chat: <code>{s.get('log_chat_id')}</code>\n"
+    )
+
+
+@app.on_message(filters.command("joinreq") & filters.group)
+async def cmd_joinreq_menu(client: Client, message: Message):
+    if not (await is_telegram_group_owner(client, message.chat.id, message.from_user.id)
+            or await is_owner(message.from_user.id)):
+        await message.reply_text("⚠️ Only the group owner (or bot owner) can open join-request settings.")
+        return
+    s = await get_group_settings(message.chat.id)
+    await message.reply_text(_settings_text(message.chat, s), reply_markup=_settings_kb(message.chat.id, s))
+
+
+@app.on_callback_query(
+    filters.regex(r"^jrs:(toggle_jr|toggle_captcha|toggle_auto|toggle_imposter|toggle_auto_decline|set_log|clear_log):-?\d+$")
+)
+async def cb_settings(client: Client, cq: CallbackQuery):
+    _, action, chat_id_s = cq.data.split(":")
+    chat_id = int(chat_id_s)
+    caller = cq.from_user
+
+    if not (await is_telegram_group_owner(client, chat_id, caller.id) or await is_owner(caller.id)):
+        await cq.answer("Only the group owner can change these settings.", show_alert=True)
+        return
+
+    s = await get_group_settings(chat_id)
+
+    if action == "toggle_jr":
+        s = await set_group_settings(chat_id, {"join_request_enabled": not s.get("join_request_enabled")})
+    elif action == "toggle_captcha":
+        s = await set_group_settings(chat_id, {"captcha_enabled": not s.get("captcha_enabled")})
+    elif action == "toggle_auto":
+        s = await set_group_settings(chat_id, {"captcha_auto_approve": not s.get("captcha_auto_approve")})
+    elif action == "toggle_imposter":
+        s = await set_group_settings(chat_id, {"imposter_enabled": not s.get("imposter_enabled")})
+    elif action == "toggle_auto_decline":
+        s = await set_group_settings(chat_id, {"auto_decline_high_risk": not s.get("auto_decline_high_risk")})
+    elif action == "clear_log":
+        s = await set_group_settings(chat_id, {"log_chat_id": None})
+        await cq.answer("Log chat cleared.")
+    elif action == "set_log":
+        sent = await safe_send_message(
+            client, caller.id,
+            f"Reply to THIS message with the numeric chat ID to use as the log chat for "
+            f"<code>{chat_id}</code> (e.g. <code>-1001234567890</code>).",
+        )
+        if sent:
+            LOG_SET_PROMPTS[caller.id] = {"chat_id": chat_id, "prompt_msg_id": sent.id,
+                                           "expires_at": now_utc() + datetime.timedelta(minutes=5)}
+            await cq.answer("Check your PM.", show_alert=True)
+        else:
+            await cq.answer("Start the bot in PM first, then try again.", show_alert=True)
+        return
+
+    await cq.answer("Updated.")
+    try:
+        chat = await client.get_chat(chat_id)
+        await safe_edit_message(client, cq.message.chat.id, cq.message.id, _settings_text(chat, s),
+                                 reply_markup=_settings_kb(chat_id, s))
+    except RPCError:
+        pass
+
+
+LOG_SET_PROMPTS: Dict[int, Dict[str, Any]] = {}
+
+
+@app.on_message(filters.private & filters.reply & ~filters.bot, group=91)
+async def owner_set_log_reply(client: Client, message: Message):
+    admin_id = message.from_user.id
+    state = LOG_SET_PROMPTS.get(admin_id)
+    if not state or not message.reply_to_message:
+        return
+    if message.reply_to_message.id != state["prompt_msg_id"]:
+        return
+    if now_utc() > state["expires_at"]:
+        LOG_SET_PROMPTS.pop(admin_id, None)
+        await message.reply_text("❌ Session expired, please try again from /joinreq.")
+        return
+
+    text = (message.text or "").strip()
+    try:
+        log_chat_id = int(text)
+        await client.get_chat(log_chat_id)  # validate it's reachable
+    except (ValueError, RPCError) as e:
+        await message.reply_text(f"⚠️ Invalid or unreachable chat ID: {esc(str(e))}")
+        return
+
+    chat_id = state["chat_id"]
+    if not await is_telegram_group_owner(client, chat_id, admin_id) and not await is_owner(admin_id):
+        LOG_SET_PROMPTS.pop(admin_id, None)
+        await message.reply_text("You are no longer authorized for that group.")
+        return
+
+    await set_group_settings(chat_id, {"log_chat_id": log_chat_id})
+    LOG_SET_PROMPTS.pop(admin_id, None)
+    await message.reply_text(f"✅ Log chat set to <code>{log_chat_id}</code> for group <code>{chat_id}</code>.")
+    await send_log(client, log_chat_id, f"📋 Log chat configured by {mention_html(message.from_user)}.")
+
+
+# ============================================================
+# START / HELP
+# ============================================================
+START_TEXT_PRIVATE = """
+🤖 <b>Welcome to the Group Management Bot!</b>
+
+I help you run a clean, safe community:
+
+• 🚨 Join request management with approve / decline / mute / ban
+• 🛡 CAPTCHA verification before anyone is let in
+• 🎭 Imposter / pretender detection (name &amp; username changes)
+• 🔨 Ban / unban, 🤐 mute / unmute, and temporary versions of both
+• 📋 Declined &amp; banned user history, with pagination
+• 👑 Internal bot-admin system, separate from Telegram admins
+
+Add me to your group as an <b>administrator</b> with permission to
+invite users and restrict members, then enable Join Requests in
+your group's chat settings and run <code>/joinreq</code>.
+
+Use /help to see every command.
+"""
+
+START_TEXT_GROUP = "👋 I'm online. Use /help to see what I can do, or /joinreq to configure this group."
+
+HELP_TEXT = """
+🛡 <b>JOIN REQUESTS</b>
+/joinreq — open settings menu (group owner only)
+/approveall — approve all pending join requests
+/rejectall — decline all pending join requests
+/declined — show declined users (paginated)
+/banned — show banned users (paginated)
+
+🔨 <b>MODERATION</b>
+/ban [reply|id|@user] [reason] — ban a user
+/unban [reply|id|@user] — unban a user
+/mute [reply|id|@user] [reason] — mute a user
+/unmute [reply|id|@user] — unmute a user
+/tmute [reply|id|@user] &lt;10m|2h|1d&gt; [reason] — temporary mute
+/tban [reply|id|@user] &lt;10m|2h|1d&gt; [reason] — temporary ban
+
+🎭 <b>SECURITY</b>
+/imposter enable — turn on pretender detection for this group
+/imposter disable — turn it off
+
+👑 <b>ADMIN MANAGEMENT</b>
+/addadmin [reply|id|@user] — add a bot admin (owner only)
+/removeadmin [reply|id|@user] — remove a bot admin (owner only)
+/admins — list bot admins &amp; Telegram group admins
+
+ℹ️ <b>GENERAL</b>
+/start — welcome message
+/help — this menu
+"""
+
+
+@app.on_message(filters.command("start"))
+async def cmd_start(client: Client, message: Message):
+    if message.chat.type == "private":
+        await message.reply_text(
+            START_TEXT_PRIVATE,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📚 Help", callback_data="show_help")],
+                ]
+            ),
+        )
+    else:
+        await message.reply_text(START_TEXT_GROUP)
+
+
+@app.on_message(filters.command("help"))
+async def cmd_help(client: Client, message: Message):
+    await message.reply_text(HELP_TEXT)
+
+
+@app.on_callback_query(filters.regex(r"^show_help$"))
+async def cb_show_help(client: Client, cq: CallbackQuery):
+    await cq.answer()
+    await safe_send_message(client, cq.from_user.id, HELP_TEXT)
+
+
+# ============================================================
+# STARTUP / RECOVERY
+# ============================================================
+async def _recover_on_startup():
+    """Runs once at boot: purges anything that has already expired while
+    the bot was offline, and logs a summary. The periodic sweeper tasks
+    (captcha_sweeper / temp_action_sweeper) then take over continuous
+    reconciliation for the rest of the process lifetime."""
+    pending_temp = await temporary_actions_coll.count_documents({"status": "pending"})
+    pending_captcha = await captcha_sessions_coll.count_documents({"status": "pending"})
+    logger.info(
+        "Startup recovery: %s pending temporary action(s), %s pending captcha session(s) will be reconciled.",
+        pending_temp, pending_captcha,
+    )
+
+
+async def main():
+    await ensure_indexes()
+    await app.start()
+    me = await app.get_me()
+    logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+    await _recover_on_startup()
+
+    asyncio.create_task(temp_action_sweeper())
+    asyncio.create_task(captcha_sweeper())
+
+    logger.info("Background sweepers running. Bot is ready.")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.stop()
+        logger.info("Bot stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, shutting down.")
+        sys.exit(0)
