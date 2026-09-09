@@ -23,8 +23,14 @@ Only three third-party packages are required:
 Required environment variables:
     API_ID, API_HASH, BOT_TOKEN, MONGO_URL, OWNER_ID
 
-See the bottom of this file / the accompanying chat message for the
-full setup guide, command list and test checklist.
+FIX NOTE (2026-09-09)
+    Pyrogram 2.x's Client.run(coroutine) does NOT auto-start the client
+    when you pass it a custom coroutine (it only auto-starts when you call
+    app.run() with no arguments at all). The previous version of this file
+    called app.get_me() inside main() without ever calling app.start(),
+    causing an immediate "ConnectionError: Client has not been started
+    yet" crash loop. main() now explicitly calls app.start() first and
+    app.stop() in a finally block. See bottom of file.
 ====================================================================
 """
 
@@ -95,11 +101,15 @@ def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
         raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}")
 
 
-API_ID = _env_int("API_ID", "8045459")
-API_HASH = os.getenv("API_HASH", "e6d1f09120e17a4372fe022dde88511b")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8244250546:AAH_pVJpL2pr6lz_WX7CaYVw8hMGitq2Oug")
-MONGO_URL = os.getenv("MONGO_URL", "mongodb+srv://zewdatabase:ijoXgdmQ0NCyg9DO@zewgame.urb3i.mongodb.net/ontap?retryWrites=true&w=majority")
-OWNER_ID = _env_int("OWNER_ID", "8671058334")
+# NOTE: Hardcoded fallback credentials were removed. Set these as real
+# environment variables (or in a .env file) instead of relying on
+# defaults baked into source code — especially since this file may end
+# up in version control or be shared.
+API_ID = _env_int("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URL = os.getenv("MONGO_URL")
+OWNER_ID = _env_int("OWNER_ID")
 
 # Behavioural defaults (can be overridden per-group via /joinreq settings)
 DEFAULT_CAPTCHA_TIMEOUT = _env_int("CAPTCHA_TIMEOUT", 300)          # 5 minutes
@@ -2154,19 +2164,33 @@ async def _recover_on_startup():
 
 
 async def main():
-    # NOTE: app.start()/app.stop() are handled by app.run() itself. This
-    # coroutine only performs one-time setup, starts the background
-    # sweepers, and then blocks with pyrogram.idle() until shutdown.
-    await ensure_indexes()
-    me = await app.get_me()
-    logger.info("Bot started as @%s (id=%s)", me.username, me.id)
-    await _recover_on_startup()
+    # ------------------------------------------------------------
+    # THE FIX:
+    # Pyrogram 2.x's Client.run(coroutine) does NOT implicitly start the
+    # client when you pass it a custom coroutine like main(). It only
+    # auto-starts/stops when you call app.run() with NO arguments at all.
+    # Since this file passes app.run(main()), we are fully responsible
+    # for starting and stopping the client ourselves. Skipping app.start()
+    # was the exact cause of:
+    #     ConnectionError: Client has not been started yet
+    # on every single call to app.get_me() (and would have hit the same
+    # wall on the very first DB-triggered RPC call too).
+    # ------------------------------------------------------------
+    await app.start()
+    try:
+        await ensure_indexes()
+        me = await app.get_me()
+        logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+        await _recover_on_startup()
 
-    asyncio.create_task(temp_action_sweeper())
-    asyncio.create_task(captcha_sweeper())
+        asyncio.create_task(temp_action_sweeper())
+        asyncio.create_task(captcha_sweeper())
 
-    logger.info("Background sweepers running. Bot is ready.")
-    await idle()
+        logger.info("Background sweepers running. Bot is ready.")
+        await idle()
+    finally:
+        await app.stop()
+        logger.info("Client stopped cleanly.")
 
 
 if __name__ == "__main__":
