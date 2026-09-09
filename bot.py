@@ -62,11 +62,11 @@ from pymongo import ReturnDocument
 # CONFIGURATION
 # ==============================================================================
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MONGO_URI = os.getenv("MONGO_URI", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+API_ID = int(os.getenv("API_ID", "8045459"))
+API_HASH = os.getenv("API_HASH", "e6d1f09120e17a4372fe022dde88511b")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8244250546:AAEuPSONBf-pnA-pdB3ceNvIqWjRB30eH1w")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://zewdatabase:ijoXgdmQ0NCyg9DO@zewgame.urb3i.mongodb.net/ontap?retryWrites=true&w=majority")
+OWNER_ID = int(os.getenv("OWNER_ID", "8671058334"))
 
 # Optional tuning knobs (all overridable via env vars)
 CAPTCHA_TIMEOUT_SECONDS = int(os.getenv("CAPTCHA_TIMEOUT_SECONDS", "300"))       # 5 minutes
