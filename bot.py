@@ -95,11 +95,11 @@ def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
         raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}")
 
 
-API_ID = _env_int("API_ID", "8045459"))
+API_ID = _env_int("API_ID", "8045459")
 API_HASH = os.getenv("API_HASH", "e6d1f09120e17a4372fe022dde88511b")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8244250546:AAEuPSONBf-pnA-pdB3ceNvIqWjRB30eH1w")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8244250546:AAH_pVJpL2pr6lz_WX7CaYVw8hMGitq2Oug")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb+srv://zewdatabase:ijoXgdmQ0NCyg9DO@zewgame.urb3i.mongodb.net/ontap?retryWrites=true&w=majority")
-OWNER_ID = _env_int("OWNER_ID", "8671058334"))
+OWNER_ID = _env_int("OWNER_ID", "8671058334")
 
 # Behavioural defaults (can be overridden per-group via /joinreq settings)
 DEFAULT_CAPTCHA_TIMEOUT = _env_int("CAPTCHA_TIMEOUT", 300)          # 5 minutes
